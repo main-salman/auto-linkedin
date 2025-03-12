@@ -922,13 +922,14 @@ class LinkedInController:
                             () => {
                                 return {
                                     hasDialog: !!document.querySelector('div[role="dialog"]') || !!document.querySelector('.artdeco-modal'),
-                                    hasBackdrop: !!document.querySelector('.artdeco-modal-overlay')
+                                    hasBackdrop: !!document.querySelector('.artdeco-modal-overlay'),
+                                    dialogText: document.querySelector('div[role="dialog"]')?.textContent || document.querySelector('.artdeco-modal')?.textContent || ''
                                 };
                             }
                             """)
                             
                             if has_dialog.get('hasDialog', False):
-                                logger.info("Dialog detected after media upload, attempting to close it")
+                                logger.info(f"Dialog detected after media upload, attempting to close it. Dialog text: {has_dialog.get('dialogText', '')}")
                                 
                                 # Try multiple approaches to close the dialog
                                 close_button_selectors = [
@@ -937,58 +938,115 @@ class LinkedInController:
                                     "button.media-upload-cancel",
                                     "button.artdeco-modal__dismiss",
                                     ".artdeco-modal__dismiss",
-                                    ".artdeco-modal__close"
+                                    ".artdeco-modal__close",
+                                    "button.artdeco-button--secondary",
+                                    "button.artdeco-button--primary", 
+                                    "button.confirm-dialog-btn",
+                                    "button[data-control-name='dialog_cancel_btn']",
+                                    "button[data-control-name='dialog_confirm_btn']"
                                 ]
                                 
-                                # Try clicking close buttons
-                                close_clicked = False
-                                for selector in close_button_selectors:
-                                    try:
-                                        close_button = await self.page.query_selector(selector)
-                                        if close_button:
-                                            await close_button.click()
-                                            logger.info(f"Clicked close button with selector: {selector}")
-                                            close_clicked = True
-                                            await self._wait_for_human_delay(1000, 1500)
-                                            break
-                                    except Exception as e:
-                                        logger.debug(f"Failed to click close button {selector}: {str(e)}")
+                                # First try to find and click Done/Next/Continue buttons if present
+                                # This is for handling cases where LinkedIn expects you to edit the media before posting
+                                done_button_clicked = await self.page.evaluate("""
+                                () => {
+                                    const buttons = Array.from(document.querySelectorAll('button'));
+                                    const doneButton = buttons.find(btn => 
+                                        ['Done', 'Next', 'Continue', 'Add', 'Save'].includes(btn.textContent.trim()) &&
+                                        btn.offsetParent !== null
+                                    );
+                                    
+                                    if (doneButton) {
+                                        console.log('Clicking button with text:', doneButton.textContent);
+                                        doneButton.click();
+                                        return true;
+                                    }
+                                    
+                                    return false;
+                                }
+                                """)
                                 
-                                # If no button clicked but we have backdrop, click outside the dialog
-                                if not close_clicked and has_dialog.get('hasBackdrop', False):
-                                    try:
-                                        # Click away from the dialog (top corner)
-                                        await self.page.mouse.click(10, 10)
-                                        logger.info("Clicked outside dialog to dismiss it")
-                                        await self._wait_for_human_delay(1000, 1500)
-                                    except Exception as e:
-                                        logger.debug(f"Failed to click outside dialog: {str(e)}")
+                                if done_button_clicked:
+                                    logger.info("Clicked Done/Next/Continue button")
+                                    await self._wait_for_human_delay(1000, 2000)
                                 
-                                # If still not closed, try pressing Escape
-                                has_dialog_after_clicks = await self.page.evaluate("""
+                                # If still dialog, try to close it
+                                has_dialog_after_continue = await self.page.evaluate("""
                                 () => {
                                     return !!document.querySelector('div[role="dialog"]') || 
                                            !!document.querySelector('.artdeco-modal');
                                 }
                                 """)
                                 
-                                if has_dialog_after_clicks:
-                                    logger.info("Dialog still detected, pressing Escape")
-                                    await self.page.keyboard.press("Escape")
-                                    await self._wait_for_human_delay(1000, 1500)
+                                if has_dialog_after_continue:
+                                    close_clicked = False
+                                    for selector in close_button_selectors:
+                                        try:
+                                            await self.page.click(selector, timeout=3000)
+                                            logger.info(f"Clicked close button with selector: {selector}")
+                                            close_clicked = True
+                                            await self._wait_for_human_delay(1000, 1500)
+                                            break
+                                        except Exception as e:
+                                            logger.debug(f"Failed to click close button {selector}: {str(e)}")
                                     
-                                    # Verify dialog closed after Escape
-                                    has_dialog_after_escape = await self.page.evaluate("""
+                                    # If no button clicked but we have backdrop, click outside the dialog
+                                    if not close_clicked and has_dialog.get('hasBackdrop', False):
+                                        try:
+                                            # Click away from the dialog (top corner)
+                                            await self.page.mouse.click(10, 10)
+                                            logger.info("Clicked outside dialog to dismiss it")
+                                            await self._wait_for_human_delay(1000, 1500)
+                                        except Exception as e:
+                                            logger.debug(f"Failed to click outside dialog: {str(e)}")
+                                    
+                                    # If still not closed, try pressing Escape
+                                    has_dialog_after_clicks = await self.page.evaluate("""
                                     () => {
                                         return !!document.querySelector('div[role="dialog"]') || 
                                                !!document.querySelector('.artdeco-modal');
                                     }
                                     """)
                                     
-                                    if has_dialog_after_escape:
-                                        logger.warning("Dialog still open after multiple close attempts")
-                                        # Continue anyway, the media might still be attached
-                                
+                                    if has_dialog_after_clicks:
+                                        logger.info("Dialog still detected, pressing Escape")
+                                        await self.page.keyboard.press("Escape")
+                                        await self._wait_for_human_delay(1000, 1500)
+                                        
+                                        # As a last resort, try refreshing the page
+                                        has_dialog_after_escape = await self.page.evaluate("""
+                                        () => {
+                                            return !!document.querySelector('div[role="dialog"]') || 
+                                                   !!document.querySelector('.artdeco-modal');
+                                        }
+                                        """)
+                                        
+                                        if has_dialog_after_escape:
+                                            logger.warning("Dialog still open after multiple close attempts. Taking a screenshot and attempting to recover.")
+                                            
+                                            # Take screenshot of stuck dialog
+                                            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                                            screenshot_path = os.path.join(debug_dir, f"stuck_dialog_{timestamp}.png")
+                                            await self.page.screenshot(path=screenshot_path)
+                                            
+                                            try:
+                                                # Try to reload the page as a last resort
+                                                logger.info("Reloading page to escape stuck dialog")
+                                                await self.page.reload(wait_until="domcontentloaded")
+                                                await self._wait_for_human_delay(3000, 5000)
+                                                
+                                                # Start a new post attempt
+                                                logger.info("Attempting to restart post process after reload")
+                                                
+                                                # We need to abort this attempt and signal for retry
+                                                return {
+                                                    "success": False,
+                                                    "message": "Encountered dialog that couldn't be dismissed. Page was reloaded, please retry posting.",
+                                                    "should_retry": True
+                                                }
+                                            except Exception as reload_error:
+                                                logger.error(f"Failed to reload page: {str(reload_error)}")
+                                                # Continue anyway as a last attempt
                         except Exception as e:
                             logger.warning(f"Could not confirm media upload completion: {str(e)}")
                             # Check if media is visible despite the error
@@ -1006,6 +1064,54 @@ class LinkedInController:
                             except Exception:
                                 pass
                             # Continue anyway
+            
+            # Check if we need to wait for media to finish uploading
+            if media_files:
+                try:
+                    # Check for progress indicators that might suggest media is still being processed
+                    upload_in_progress = await self.page.evaluate("""
+                    () => {
+                        // Check for various progress indicators
+                        const hasProgressBar = !!document.querySelector('.progress-bar, .media-upload-progress');
+                        const hasSpinner = !!document.querySelector('.media-upload-spinner, .uploading-spinner, .artdeco-spinner');
+                        const hasUploadingText = document.body.textContent.includes('Uploading') || 
+                                                document.body.textContent.includes('Processing');
+                        
+                        console.log('Media upload status:', {hasProgressBar, hasSpinner, hasUploadingText});
+                        return hasProgressBar || hasSpinner || hasUploadingText;
+                    }
+                    """)
+                    
+                    if upload_in_progress:
+                        logger.info("Media upload still in progress, waiting...")
+                        # Wait for upload to complete (max 30 seconds)
+                        wait_start = time.time()
+                        while time.time() - wait_start < 30:
+                            still_uploading = await self.page.evaluate("""
+                            () => {
+                                const hasProgressBar = !!document.querySelector('.progress-bar, .media-upload-progress');
+                                const hasSpinner = !!document.querySelector('.media-upload-spinner, .uploading-spinner, .artdeco-spinner');
+                                const hasUploadingText = document.body.textContent.includes('Uploading') || 
+                                                         document.body.textContent.includes('Processing');
+                                
+                                return hasProgressBar || hasSpinner || hasUploadingText;
+                            }
+                            """)
+                            
+                            if not still_uploading:
+                                logger.info("Media upload completed")
+                                break
+                                
+                            await self._wait_for_human_delay(1000, 2000)
+                
+                    # Take a screenshot after media upload
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    screenshot_path = os.path.join(debug_dir, f"after_media_upload_{timestamp}.png")
+                    await self.page.screenshot(path=screenshot_path)
+                    logger.info(f"Saved screenshot after media upload: {screenshot_path}")
+                
+                except Exception as e:
+                    logger.warning(f"Error while checking media upload status: {str(e)}")
             
             # Wait before posting
             await self._wait_for_human_delay(1000, 2000)
@@ -1025,12 +1131,88 @@ class LinkedInController:
                 "button.artdeco-button--primary"
             ]
             
+            # Initialize post_submit_clicked variable
+            post_submit_clicked = False
+            
             # Take a screenshot before attempting to find Post button
             debug_dir = os.path.join(os.path.expanduser("~"), "auto_linkedin_debug")
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             screenshot_path = os.path.join(debug_dir, f"before_post_button_{timestamp}.png")
             await self.page.screenshot(path=screenshot_path)
             logger.info(f"Saved screenshot before clicking Post button: {screenshot_path}")
+            
+            # Check for any unexpected dialogs before attempting to post
+            has_unexpected_dialog = await self.page.evaluate("""
+            () => {
+                const dialogs = document.querySelectorAll('div[role="dialog"], .artdeco-modal');
+                if (dialogs.length > 0) {
+                    const dialogTexts = Array.from(dialogs).map(d => d.textContent.trim());
+                    return {
+                        hasDialog: true,
+                        dialogTexts: dialogTexts
+                    };
+                }
+                return { hasDialog: false };
+            }
+            """)
+            
+            if has_unexpected_dialog.get('hasDialog', False):
+                logger.warning(f"Unexpected dialog detected before posting: {has_unexpected_dialog.get('dialogTexts', [])}")
+                
+                # Try to dismiss dialogs that might be in the way
+                try:
+                    # Try pressing Escape first
+                    await self.page.keyboard.press("Escape")
+                    await self._wait_for_human_delay(1000, 1500)
+                    
+                    # Check if dialog is still there
+                    dialog_still_present = await self.page.evaluate("""
+                    () => !!document.querySelector('div[role="dialog"], .artdeco-modal')
+                    """)
+                    
+                    if dialog_still_present:
+                        # Try clicking buttons like "Done", "Continue", etc.
+                        await self.page.evaluate("""
+                        () => {
+                            const buttonTexts = ['Done', 'Next', 'Continue', 'Add', 'Save', 'Confirm', 'OK', 'Post'];
+                            const buttons = Array.from(document.querySelectorAll('button'));
+                            
+                            for (const text of buttonTexts) {
+                                const button = buttons.find(btn => 
+                                    btn.textContent.trim() === text && 
+                                    btn.offsetParent !== null
+                                );
+                                if (button) {
+                                    console.log('Clicking button with text:', button.textContent);
+                                    button.click();
+                                    return true;
+                                }
+                            }
+                            
+                            // Try clicking any visible primary button as a last resort
+                            const primaryButton = buttons.find(btn => 
+                                btn.className.includes('primary') && 
+                                btn.offsetParent !== null
+                            );
+                            if (primaryButton) {
+                                console.log('Clicking primary button:', primaryButton.textContent);
+                                primaryButton.click();
+                                return true;
+                            }
+                            
+                            return false;
+                        }
+                        """)
+                        
+                        await self._wait_for_human_delay(1000, 1500)
+                    
+                    # After attempts, take another screenshot
+                    screenshot_path = os.path.join(debug_dir, f"after_dialog_dismiss_{timestamp}.png")
+                    await self.page.screenshot(path=screenshot_path)
+                    logger.info(f"Saved screenshot after dialog dismissal attempt: {screenshot_path}")
+                    
+                except Exception as e:
+                    logger.warning(f"Error attempting to dismiss unexpected dialog: {str(e)}")
             
             # First, try to find all buttons in the composer footer
             try:
