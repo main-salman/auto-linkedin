@@ -1,0 +1,2 @@
+This is a placeholder for the Auto-LinkedIn executable. 
+The actual executable would be created by PyInstaller. 

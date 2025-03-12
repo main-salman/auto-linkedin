@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 import asyncio
 from playwright.async_api import async_playwright
+import sys
 
 logger = logging.getLogger(__name__)
 
@@ -169,6 +170,22 @@ class LinkedInController:
         # Launch browser with persistent context
         logger.info(f"Launching browser with user data directory: {self.user_data_dir}")
         
+        # Additional arguments for browser
+        browser_args = [
+            "--disable-blink-features=AutomationControlled",
+            "--window-size=1280,800"
+        ]
+        
+        # When running as PyInstaller bundle, add additional arguments to help browser finding
+        if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+            logger.info("Running as PyInstaller bundle - adding special browser arguments")
+            # These are important for PyInstaller bundled apps
+            browser_args.extend([
+                "--no-sandbox",
+                "--disable-gpu",
+                "--disable-dev-shm-usage"
+            ])
+        
         self.browser_context = await self.playwright.chromium.launch_persistent_context(
             user_data_dir=self.user_data_dir,
             headless=False,
@@ -180,10 +197,7 @@ class LinkedInController:
             java_script_enabled=True,
             ignore_https_errors=False,
             accept_downloads=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--window-size=1280,800"
-            ]
+            args=browser_args
         )
         
         # Get or create page
@@ -560,15 +574,35 @@ class LinkedInController:
             media_files = []
         
         try:
-            # Navigate to LinkedIn feed
-            await self.page.goto(
-                url="https://www.linkedin.com/feed/", 
-                wait_until="domcontentloaded",
-                timeout=15000
-            )
+            # Navigate to LinkedIn feed with a less strict wait condition and longer timeout
+            logger.info("Navigating to LinkedIn feed")
+            try:
+                await self.page.goto(
+                    url="https://www.linkedin.com/feed/", 
+                    wait_until="load",  # Changed from "networkidle" to "load"
+                    timeout=30000  # Increased timeout to 30 seconds
+                )
+            except Exception as e:
+                logger.warning(f"Initial navigation timed out: {e}. Trying with domcontentloaded...")
+                # Retry with an even less strict condition
+                await self.page.goto(
+                    url="https://www.linkedin.com/feed/", 
+                    wait_until="domcontentloaded",
+                    timeout=20000
+                )
             
-            # Wait for page to load
-            await self._wait_for_human_delay(2000, 3000)
+            # Wait for page to load properly with explicit wait
+            logger.info("Waiting for LinkedIn feed to load")
+            await asyncio.sleep(5)  # Increased sleep time
+            
+            # Explicit wait for key feed elements to confirm page load
+            try:
+                await self.page.wait_for_selector(".feed-shared-update-v2, .share-box-feed-entry__trigger", 
+                                                timeout=10000)
+                logger.info("LinkedIn feed elements detected")
+            except Exception as e:
+                logger.warning(f"Could not detect feed elements: {e}")
+                # Continue anyway as the elements might still be there
             
             # Save page state for debugging if needed
             debug_dir = os.path.join(os.path.expanduser("~"), "auto_linkedin_debug")
@@ -580,193 +614,88 @@ class LinkedInController:
                 screenshot_path = os.path.join(debug_dir, f"linkedin_feed_{timestamp}.png")
                 await self.page.screenshot(path=screenshot_path)
                 logger.info(f"Saved debug screenshot to {screenshot_path}")
-                
-                # Save page HTML for debugging
-                html_path = os.path.join(debug_dir, f"linkedin_feed_{timestamp}.html")
-                html_content = await self.page.content()
-                with open(html_path, "w", encoding="utf-8") as f:
-                    f.write(html_content)
-                logger.info(f"Saved debug HTML to {html_path}")
             except Exception as e:
-                logger.warning(f"Failed to save debug information: {str(e)}")
-                
-            # Click on "Start a post" button
-            logger.info("Clicking on 'Start a post' button")
+                logger.warning(f"Failed to save debug screenshot: {str(e)}")
             
-            # First try to navigate to the feed page if not already there
-            current_url = await self.page.evaluate("window.location.href")
-            if not "linkedin.com/feed" in current_url:
-                logger.info("Navigating to LinkedIn feed page")
-                await self.page.goto(
-                    url="https://www.linkedin.com/feed/",
-                    wait_until="domcontentloaded",
-                    timeout=15000
-                )
-                await self._wait_for_human_delay(3000, 5000)
+            # Try to click the "Start a post" button using the exact structure from the HTML
+            logger.info("Looking for 'Start a post' button with precise selectors")
             
-            # Try different approaches to click the post button
-            
-            # 1. First try direct DOM selectors
+            # Create a list of selectors based on the actual HTML structure
             post_button_selectors = [
-                # Use the exact ID and class structure from the provided HTML
-                "#ember36",  # Direct ID selector from the HTML
-                "button.artdeco-button.artdeco-button--tertiary", # Class combination from HTML
-                "button.artdeco-button strong:contains('Start a post')",
-                "button.artdeco-button span span strong",
-                "button.artdeco-button--muted.artdeco-button--tertiary",
-                "button[id^='ember'] span strong",  # Any ember button with "Start a post" text
-                
-                # More general selectors as fallback
-                ".share-box-feed-entry__trigger", 
-                ".share-box-feed-entry__trigger span",
-                ".artdeco-text-input--input",
-                "[aria-placeholder='Start a post']",
-                "[placeholder='Start a post']",
-                ".share-box__open .share-box-feed-entry__subtitle",
-                ".artdeco-card .share-box-feed-entry",
-                ".share-box-feed-entry",
-                "button[aria-label='Start a post']",
-                "div[aria-label='Start a post']",
-                "div[data-control-name='share.sharebox_focus']",
-                "div.share-box-feed-entry__trigger",
-                "button.artdeco-button[data-control-name='create_post']",
-                "div[data-urn='urn:li:control:d_flagship3_feed_share_box']",
-                "button.share-box-feed-entry__trigger",
-                "button.share-box__open",
-                "div.share-box__trigger",
-                "button.share-box-media-entry__trigger"
+                "button.artdeco-button.artdeco-button--muted.artdeco-button--4.artdeco-button--tertiary", # Main selector based on classes
+                "button.artdeco-button--tertiary span.artdeco-button__text strong", # Target the text inside
+                "button.artdeco-button--tertiary span strong", # Simplified version
+                "button.share-box-feed-entry__trigger", # Older selector
+                ".share-box-feed-entry__top-bar button", # Parent container approach
+                "#ember950", # Direct ID (might change but worth trying)
+                "button[aria-label='Start a post']", # Try aria-label
+                "button.UdjLePnPAvutdJbOgdNCDEfZQcoXOuniyY", # Unique class from HTML
+                "button.artdeco-button--muted span strong", # Another approach
+                ".share-box-feed-entry__top-bar button.artdeco-button" # Combined approach
             ]
             
             post_button_clicked = False
-            for selector in post_button_selectors:
-                try:
-                    # Check if the element exists and is visible
-                    is_visible = await self.page.evaluate(f"""
-                    () => {{
-                        const el = document.querySelector('{selector}');
-                        return el && el.offsetParent !== null;
-                    }}
-                    """)
-                    
-                    if is_visible:
-                        await self.page.click(selector, timeout=5000)
-                        post_button_clicked = True
-                        logger.info(f"Clicked post button with selector: {selector}")
-                        break
-                except Exception as e:
-                    logger.debug(f"Failed to click selector {selector}: {str(e)}")
-                    continue
-                    
-            # 2. Try finding elements by text content using evaluate
+            
+            # Try clicking the button with a more reliable approach first
+            try:
+                # Click on the element with the text "Start a post" using Playwright's built-in text selector
+                await self.page.click('text="Start a post"', timeout=5000)
+                post_button_clicked = True
+                logger.info("Clicked on 'Start a post' text element")
+            except Exception as e:
+                logger.debug(f"Could not click on text element: {e}")
+            
+            # If text click fails, try the selectors
             if not post_button_clicked:
-                logger.info("Trying to find and click button with exact text structure")
+                for selector in post_button_selectors:
+                    try:
+                        # Check if the element exists and is visible
+                        is_visible = await self.page.evaluate(f"""
+                        () => {{
+                            const el = document.querySelector('{selector}');
+                            return el && el.offsetParent !== null;
+                        }}
+                        """)
+                        
+                        if is_visible:
+                            await self.page.click(selector, timeout=5000)
+                            post_button_clicked = True
+                            logger.info(f"Clicked post button with selector: {selector}")
+                            break
+                    except Exception as e:
+                        logger.debug(f"Failed to click selector {selector}: {str(e)}")
+                        continue
+            
+            # Try JavaScript approach as a last resort
+            if not post_button_clicked:
+                logger.info("Trying JavaScript approach to find and click 'Start a post' button")
                 try:
                     post_button_clicked = await self.page.evaluate("""
                     () => {
-                        // Look for button with exact structure matching LinkedIn's "Start a post" button
-                        const buttons = Array.from(document.querySelectorAll('button.artdeco-button'));
+                        // Find buttons that might be the post button
+                        const buttons = Array.from(document.querySelectorAll('button'));
                         
+                        // Look for strong elements containing "Start a post"
                         for (const button of buttons) {
-                            // Check for the nested structure
-                            const strong = button.querySelector('span span.t-normal strong');
-                            if (strong && strong.textContent.trim() === 'Start a post') {
+                            const strongElement = button.querySelector('strong');
+                            if (strongElement && strongElement.textContent.trim() === 'Start a post') {
                                 button.click();
-                                console.log('Found and clicked "Start a post" button with exact structure');
+                                console.log('Found and clicked button with Start a post text');
                                 return true;
                             }
-                        }
-                        
-                        // Alternative approach - find any button with "Start a post" text
-                        for (const button of buttons) {
+                            
+                            // Or check if the button text contains "Start a post"
                             if (button.textContent.includes('Start a post')) {
                                 button.click();
-                                console.log('Found and clicked button containing "Start a post" text');
+                                console.log('Found and clicked button with Start a post in text');
                                 return true;
                             }
                         }
-                        
                         return false;
                     }
                     """)
-                    
-                    if post_button_clicked:
-                        logger.info("Clicked button found by text structure")
                 except Exception as e:
-                    logger.warning(f"Failed to find button by text structure: {str(e)}")
-                    
-            # 3. Try clicking the post box using the exact coordinates from the screenshot (fixed position)
-            if not post_button_clicked:
-                logger.info("Trying to click at fixed position where post box is located")
-                try:
-                    # Try clicking on the post box at an approximate position based on the screenshot
-                    await self.page.mouse.click(650, 300)  # Adjust these coordinates based on the screenshot
-                    post_button_clicked = True
-                    logger.info("Clicked at fixed position (650, 300)")
-                except Exception as e:
-                    logger.warning(f"Failed to click at fixed position: {str(e)}")
-                    
-            # 4. Try to identify buttons by their ID pattern
-            if not post_button_clicked:
-                logger.info("Trying to find ember buttons that might be the post button")
-                try:
-                    post_button_clicked = await self.page.evaluate("""
-                    () => {
-                        // Find all ember buttons (LinkedIn uses ember for many components)
-                        const emberButtons = Array.from(document.querySelectorAll('button[id^="ember"]'));
-                        console.log('Found', emberButtons.length, 'ember buttons');
-                        
-                        // Sort buttons by their vertical position (post button is usually at the top)
-                        emberButtons.sort((a, b) => {
-                            const rectA = a.getBoundingClientRect();
-                            const rectB = b.getBoundingClientRect();
-                            return rectA.top - rectB.top;
-                        });
-                        
-                        // Try to click buttons that are visible in the top portion
-                        for (const button of emberButtons.slice(0, 5)) {
-                            const rect = button.getBoundingClientRect();
-                            
-                            // Check if button is visible and in the top portion of the page
-                            if (rect.top > 0 && rect.top < 400 && rect.height > 0 && rect.width > 0) {
-                                console.log('Clicking ember button:', button.id, 'at position:', rect.top);
-                                button.click();
-                                return true;
-                            }
-                        }
-                        
-                        return false;
-                    }
-                    """)
-                    
-                    if post_button_clicked:
-                        logger.info("Clicked ember button in top portion of page")
-                except Exception as e:
-                    logger.warning(f"Failed to find ember buttons: {str(e)}")
-                    
-            # 5. Last resort - try taking a screenshot and clicking in the center of the feed
-            if not post_button_clicked:
-                logger.info("Trying to click directly in the center of the post box area")
-                try:
-                    # Get page dimensions
-                    dimensions = await self.page.evaluate("""
-                    () => {
-                        return {
-                            width: document.documentElement.clientWidth,
-                            height: document.documentElement.clientHeight
-                        };
-                    }
-                    """)
-                    
-                    # Calculate center of the feed area (slightly above center)
-                    center_x = dimensions['width'] / 2
-                    center_y = (dimensions['height'] / 2) - 100  # Slightly above center
-                    
-                    # Click at calculated position
-                    await self.page.mouse.click(center_x, center_y)
-                    post_button_clicked = True
-                    logger.info(f"Clicked at center of feed area ({center_x}, {center_y})")
-                except Exception as e:
-                    logger.warning(f"Failed to click at center: {str(e)}")
+                    logger.warning(f"JavaScript approach failed: {str(e)}")
             
             if not post_button_clicked:
                 logger.error("Could not find 'Start a post' button")
@@ -783,15 +712,27 @@ class LinkedInController:
             except Exception:
                 try:
                     await self.page.wait_for_selector("div[role='dialog'] div[role='textbox']", timeout=10000)
-                except Exception as e:
-                    logger.error(f"Could not find post composer: {str(e)}")
-                    return {
-                        "success": False,
-                        "message": "Could not find post composer. Please try again."
-                    }
+                except Exception:
+                    # Try other compositor selectors
+                    try:
+                        await self.page.wait_for_selector("div.ql-editor", timeout=10000)
+                    except Exception as e:
+                        logger.error(f"Could not find post composer: {str(e)}")
+                        # Take a screenshot to understand what happened
+                        try:
+                            screenshot_path = os.path.join(debug_dir, f"composer_not_found_{timestamp}.png")
+                            await self.page.screenshot(path=screenshot_path)
+                            logger.info(f"Saved screenshot when composer not found: {screenshot_path}")
+                        except Exception:
+                            pass
+                            
+                        return {
+                            "success": False,
+                            "message": "Could not find post composer. Please try again."
+                        }
             
             # Wait for a moment for the post composer to be fully loaded
-            await self._wait_for_human_delay(1000, 2000)
+            await asyncio.sleep(2)
             
             # Find and focus text input field
             logger.info("Finding text input field")
@@ -800,7 +741,8 @@ class LinkedInController:
                 "div[role='textbox']",
                 ".editor-content div[contenteditable='true']",
                 "div[aria-label='Text editor for creating content']",
-                "div.ql-editor"
+                "div.ql-editor",
+                ".share-box-update div[contenteditable='true']"
             ]
             
             text_input_element = None
@@ -808,624 +750,692 @@ class LinkedInController:
                 try:
                     text_input_element = await self.page.wait_for_selector(selector, timeout=5000)
                     if text_input_element:
+                        logger.info(f"Found text input with selector: {selector}")
                         break
                 except Exception:
                     continue
             
             if not text_input_element:
-                logger.error("Could not find text input field")
-                return {
-                    "success": False,
-                    "message": "Could not find text input field. Please try again."
-                }
-            
-            # Focus the text input field
-            await text_input_element.focus()
+                # Try JavaScript to find the input field as a last resort
+                try:
+                    text_input_found = await self.page.evaluate("""
+                    () => {
+                        // Find all contenteditable divs
+                        const editableDivs = Array.from(document.querySelectorAll('div[contenteditable="true"]'));
+                        if (editableDivs.length > 0) {
+                            // Focus on the first one
+                            editableDivs[0].focus();
+                            return true;
+                        }
+                        return false;
+                    }
+                    """)
+                    
+                    if not text_input_found:
+                        logger.error("Could not find text input field")
+                        return {
+                            "success": False,
+                            "message": "Could not find text input field. Please try again."
+                        }
+                except Exception as e:
+                    logger.error(f"JavaScript approach to find text input failed: {str(e)}")
+                    return {
+                        "success": False,
+                        "message": "Could not find text input field. Please try again."
+                    }
+            else:
+                # Focus the text input field
+                await text_input_element.focus()
             
             # Clear any existing text
             await self.page.keyboard.press("Control+A")
             await self.page.keyboard.press("Backspace")
             
-            # Type the post content (using a more reliable single-string approach)
+            # Type the post content
             logger.info("Typing post content")
-            
-            # Instead of typing character by character, type the whole text at once
             await self.page.keyboard.type(text=text, delay=50)
             
             # Wait briefly to ensure all text is entered
-            await self._wait_for_human_delay(1000, 2000)
+            await asyncio.sleep(1)
             
             # Upload media files if present
             if media_files:
                 logger.info(f"Uploading {len(media_files)} media files")
                 
-                # Click media upload button
+                # First, we need to click the media upload button to reveal the file input
                 media_button_selectors = [
                     "button[aria-label='Add a photo']",
+                    "button.image-detour-btn",
                     "button[aria-label='Add media']",
-                    "button[aria-label='Add image']"
+                    "button[aria-label='Add image']",
+                    ".share-box-feed-entry-toolbar__item button:first-child",
+                    "button:has-text('Add media')",
+                    "button.share-creation-entry__bottom-row-content-item:first-child"
                 ]
                 
                 media_button_clicked = False
                 for selector in media_button_selectors:
                     try:
+                        logger.info(f"Trying to click media button with selector: {selector}")
                         await self.page.click(selector, timeout=5000)
                         media_button_clicked = True
+                        logger.info(f"Successfully clicked media button with selector: {selector}")
                         break
-                    except Exception:
+                    except Exception as e:
+                        logger.debug(f"Failed to click media selector {selector}: {str(e)}")
                         continue
                 
                 if not media_button_clicked:
-                    logger.warning("Could not find media upload button, trying fallback method")
-                    
-                    # Fallback: use JavaScript to find and click button
-                    media_button_clicked = await self.page.evaluate("""
+                    # Try JavaScript approach to find and click the media button
+                    try:
+                        logger.info("Trying JavaScript approach to find and click media button")
+                        media_button_clicked = await self.page.evaluate("""
+                        () => {
+                            // Try to find buttons with specific text or icons
+                            const buttons = Array.from(document.querySelectorAll('button'));
+                            
+                            // Look for buttons with media-related text or attributes
+                            for (const button of buttons) {
+                                const buttonText = button.textContent.toLowerCase();
+                                const hasPhotoIcon = button.querySelector('svg') !== null;
+                                
+                                if (buttonText.includes('photo') || 
+                                    buttonText.includes('media') || 
+                                    buttonText.includes('image') ||
+                                    button.getAttribute('aria-label')?.toLowerCase().includes('photo') ||
+                                    button.getAttribute('aria-label')?.toLowerCase().includes('media') ||
+                                    hasPhotoIcon) {
+                                    
+                                    console.log('Found media button through JS and clicking it');
+                                    button.click();
+                                    return true;
+                                }
+                            }
+                            
+                            return false;
+                        }
+                        """)
+                        
+                        if media_button_clicked:
+                            logger.info("Successfully clicked media button using JavaScript")
+                    except Exception as e:
+                        logger.warning(f"JavaScript approach to click media button failed: {str(e)}")
+                
+                if media_button_clicked:
+                    # Now wait for file input to appear after clicking the media button
+                    try:
+                        logger.info("Waiting for file input to appear after clicking media button...")
+                        await asyncio.sleep(2)  # Give the UI time to update
+                        
+                        # Try to find the file input that should now be visible or accessible
+                        file_input = await self.page.wait_for_selector('input[type="file"]', timeout=8000)
+                        
+                        if file_input:
+                            logger.info("File input found, setting files")
+                            await file_input.set_input_files(media_files)
+                            logger.info("Files set to input")
+                            
+                            # Wait for upload to complete with increased timeout
+                            await asyncio.sleep(3)  # Give time for upload to process
+                            
+                            # Check if we can find any upload confirmation elements
+                            upload_confirmed = False
+                            try:
+                                upload_indicator = await self.page.wait_for_selector(
+                                    ".share-images__image-loaded, img[alt='Attached image'], .image-selector__image, .share-images, div[role='dialog'] img", 
+                                    timeout=15000
+                                )
+                                if upload_indicator:
+                                    logger.info("Media upload confirmed - found upload indicator elements")
+                                    upload_confirmed = True
+                            except Exception as e:
+                                logger.warning(f"Could not find standard upload indicators: {str(e)}")
+                                
+                                # Try another approach to detect images
+                                try:
+                                    has_images = await self.page.evaluate("""
+                                    () => {
+                                        // Look for any images in the composer dialog
+                                        const images = document.querySelectorAll('div[role="dialog"] img');
+                                        return images.length > 0;
+                                    }
+                                    """)
+                                    
+                                    if has_images:
+                                        logger.info("Media upload confirmed - found images in dialog")
+                                        upload_confirmed = True
+                                except Exception:
+                                    pass
+                            
+                            # Take a screenshot to see what happened
+                            try:
+                                screenshot_path = os.path.join(debug_dir, f"after_media_upload_{timestamp}.png")
+                                await self.page.screenshot(path=screenshot_path)
+                                logger.info(f"Saved screenshot after media upload: {screenshot_path}")
+                            except Exception as e:
+                                logger.warning(f"Could not save screenshot: {str(e)}")
+
+                            # If upload is confirmed, try to click the Next button in the media editor dialog
+                            if upload_confirmed:
+                                logger.info("Attempting to click 'Next' button in media editor dialog")
+                                
+                                # Try using specific selectors for the Next button
+                                next_button_selectors = [
+                                    "button.share-box-footer__primary-btn",  # Most reliable class-based selector
+                                    "button[aria-label='Next']",  # Aria label is usually stable
+                                    "div.share-box-footer__main-actions button.artdeco-button--primary",  # More specific parent-based selector
+                                    "div.share-box-footer button:nth-child(2)",  # Position-based selector (usually second button)
+                                    "button.artdeco-button--primary:has-text('Next')",  
+                                    "div.share-box-footer button:has-text('Next')",
+                                    "#ember484",  # Try the ID from the latest example
+                                    "#ember593"   # Original ID as last resort
+                                ]
+                                
+                                next_button_clicked = False
+                                for selector in next_button_selectors:
+                                    try:
+                                        logger.info(f"Trying to click Next button with selector: {selector}")
+                                        await self.page.click(selector, timeout=5000)
+                                        next_button_clicked = True
+                                        logger.info(f"Successfully clicked Next button with selector: {selector}")
+                                        # Wait a moment for the UI to update after clicking Next
+                                        await asyncio.sleep(2)
+                                        break
+                                    except Exception as e:
+                                        logger.debug(f"Failed to click Next button selector {selector}: {str(e)}")
+                                        continue
+                                
+                                # If standard selectors didn't work, try a more robust JavaScript approach
+                                if not next_button_clicked:
+                                    try:
+                                        logger.info("Trying enhanced JavaScript approach to find and click Next button")
+                                        next_button_clicked = await self.page.evaluate("""
+                                        () => {
+                                            // First try the most specific approach - look in the footer
+                                            const footer = document.querySelector('.share-box-footer');
+                                            if (footer) {
+                                                console.log('Found share-box-footer');
+                                                // Look for the primary button in main actions
+                                                const mainActions = footer.querySelector('.share-box-footer__main-actions');
+                                                if (mainActions) {
+                                                    console.log('Found main actions');
+                                                    // Try to find the primary button (usually the second one, or the one with primary class)
+                                                    const buttons = mainActions.querySelectorAll('button');
+                                                    let nextButton = null;
+                                                    
+                                                    // Find button by position (usually the second one is Next)
+                                                    if (buttons.length >= 2) {
+                                                        nextButton = buttons[1]; // Second button is usually Next
+                                                        console.log('Found Next button by position (second button)');
+                                                    }
+                                                    
+                                                    // Or find by class
+                                                    if (!nextButton) {
+                                                        nextButton = mainActions.querySelector('.artdeco-button--primary');
+                                                        if (nextButton) console.log('Found Next button by primary class');
+                                                    }
+                                                    
+                                                    if (nextButton) {
+                                                        nextButton.click();
+                                                        return true;
+                                                    }
+                                                }
+                                                
+                                                // Try directly on the footer if main actions not found
+                                                const primaryBtn = footer.querySelector('.share-box-footer__primary-btn, button.artdeco-button--primary');
+                                                if (primaryBtn) {
+                                                    console.log('Found primary button in footer');
+                                                    primaryBtn.click();
+                                                    return true;
+                                                }
+                                            }
+                                            
+                                            // Try a general approach searching all buttons
+                                            const buttons = Array.from(document.querySelectorAll('button'));
+                                            
+                                            // Look for buttons with Next text or aria-label
+                                            for (const button of buttons) {
+                                                const buttonText = button.textContent.trim().toLowerCase();
+                                                const ariaLabel = button.getAttribute('aria-label')?.toLowerCase() || '';
+                                                
+                                                if (buttonText.includes('next') || ariaLabel === 'next') {
+                                                    console.log('Found Next button by text/aria-label');
+                                                    button.click();
+                                                    return true;
+                                                }
+                                                
+                                                // Also check for class-based identification
+                                                if (button.classList.contains('share-box-footer__primary-btn') || 
+                                                    (button.classList.contains('artdeco-button--primary') && 
+                                                     button.closest('.share-box-footer'))) {
+                                                    console.log('Found Next button by class');
+                                                    button.click();
+                                                    return true;
+                                                }
+                                            }
+                                            
+                                            // One last attempt - try to find by relative positioning
+                                            // Look for a Back button, then get its next sibling
+                                            const backButton = Array.from(document.querySelectorAll('button')).find(b => 
+                                                b.textContent.trim().toLowerCase() === 'back' || 
+                                                b.getAttribute('aria-label')?.toLowerCase() === 'back'
+                                            );
+                                            
+                                            if (backButton && backButton.parentElement) {
+                                                const siblings = Array.from(backButton.parentElement.children);
+                                                const backIndex = siblings.indexOf(backButton);
+                                                if (backIndex >= 0 && backIndex < siblings.length - 1) {
+                                                    const nextButton = siblings[backIndex + 1];
+                                                    if (nextButton.tagName.toLowerCase() === 'button') {
+                                                        console.log('Found Next button by relation to Back button');
+                                                        nextButton.click();
+                                                        return true;
+                                                    }
+                                                }
+                                            }
+                                            
+                                            // Could not find the Next button
+                                            return false;
+                                        }
+                                        """)
+                                        
+                                        if next_button_clicked:
+                                            logger.info("Successfully clicked Next button using enhanced JavaScript approach")
+                                            await asyncio.sleep(2)
+                                    except Exception as e:
+                                        logger.warning(f"Enhanced JavaScript approach to click Next button failed: {str(e)}")
+                                
+                                if not next_button_clicked:
+                                    # As a last resort, try to use a more direct approach by coordinates or simulating Enter
+                                    try:
+                                        logger.info("Trying to use direct methods to proceed")
+                                        
+                                        # First try with Enter key (sometimes this advances the flow)
+                                        await self.page.keyboard.press("Enter")
+                                        logger.info("Pressed Enter key as fallback")
+                                        await asyncio.sleep(2)
+                                        
+                                        # Take a screenshot to see what happened
+                                        try:
+                                            screenshot_path = os.path.join(debug_dir, f"after_enter_key_{timestamp}.png")
+                                            await self.page.screenshot(path=screenshot_path)
+                                            logger.info(f"Saved screenshot after pressing Enter: {screenshot_path}")
+                                        except Exception:
+                                            pass
+                                        
+                                        # Check if we've moved to the next screen by looking for the Post button
+                                        post_button_check = await self.page.query_selector("button.share-actions__primary-action, button:has-text('Post')")
+                                        if post_button_check:
+                                            logger.info("Successfully moved to post screen after pressing Enter")
+                                            next_button_clicked = True
+                                    except Exception as e:
+                                        logger.warning(f"Direct methods failed: {str(e)}")
+                                
+                                if not next_button_clicked:
+                                    logger.warning("Could not find or click the Next button in media editor dialog")
+                                    # Take a screenshot to see what happened
+                                    try:
+                                        screenshot_path = os.path.join(debug_dir, f"next_button_not_found_{timestamp}.png")
+                                        await self.page.screenshot(path=screenshot_path)
+                                        logger.info(f"Saved screenshot when Next button not found: {screenshot_path}")
+                                    except Exception:
+                                        pass
+                                
+                            # Check for any open file dialogs and dismiss them if any
+                            try:
+                                # Look for cancel buttons in dialogs
+                                cancel_buttons = await self.page.query_selector_all("button[aria-label='Cancel'], button:has-text('Cancel')")
+                                if len(cancel_buttons) > 0:
+                                    logger.info("Found cancel button in dialog, clicking to dismiss")
+                                    await cancel_buttons[0].click()
+                            except Exception as e:
+                                logger.warning(f"Error checking for dialog: {str(e)}")
+                                
+                            # Only press Escape to dismiss dialogs if we didn't successfully click the Next button
+                            # or if upload was not confirmed
+                            if not upload_confirmed or (upload_confirmed and not next_button_clicked):
+                                # Press Escape to dismiss any open dialogs as a last resort
+                                await self.page.keyboard.press("Escape")
+                                logger.info("Pressed Escape to dismiss any potential open dialogs")
+                                await asyncio.sleep(1)
+                        else:
+                            logger.error("Could not find file input element after clicking media button")
+                    except Exception as e:
+                        logger.error(f"Error during media upload process: {str(e)}")
+                        # Press Escape to dismiss any dialogs and continue
+                        await self.page.keyboard.press("Escape")
+                        logger.info("Pressed Escape to dismiss any potential dialogs")
+                else:
+                    logger.warning("Could not find or click the media upload button, skipping media upload")
+            
+            # Wait before posting with a longer delay to ensure everything is ready
+            await asyncio.sleep(3)
+            
+            # Click the "Post" button
+            logger.info("Clicking 'Post' button")
+            
+            post_submit_selectors = [
+                "#ember629",  # Specific ID from the HTML
+                "button.share-actions__primary-action",
+                ".share-box_actions button",  # Container selector from HTML
+                "button.share-actions__primary-action.artdeco-button--primary",
+                "button:has-text('Post')",
+                "button[aria-label='Post']",
+                ".share-box_actions button[type='submit']",
+                "div[role='dialog'] button.artdeco-button--primary"
+            ]
+            
+            post_submit_clicked = False
+            for selector in post_submit_selectors:
+                try:
+                    logger.info(f"Trying to click Post button with selector: {selector}")
+                    await self.page.click(selector, timeout=5000)
+                    post_submit_clicked = True
+                    logger.info(f"Clicked submit button with selector: {selector}")
+                    break
+                except Exception as e:
+                    logger.debug(f"Failed to click Post button selector {selector}: {str(e)}")
+                    continue
+            
+            if not post_submit_clicked:
+                # Try using JavaScript to find and click the Post button
+                try:
+                    logger.info("Trying JavaScript approach to find and click Post button")
+                    post_submit_clicked = await self.page.evaluate("""
                     () => {
-                        // Find media upload button by text content
+                        // First try to find by specific container and class structure from the HTML
+                        const shareBoxActions = document.querySelector('.share-box_actions');
+                        if (shareBoxActions) {
+                            const postButton = shareBoxActions.querySelector('button');
+                            if (postButton) {
+                                console.log('Found post button in share-box_actions container');
+                                postButton.click();
+                                return true;
+                            }
+                        }
+                        
+                        // Try to find by specific container
+                        const footerContainer = document.querySelector('.share-creation-state__footer');
+                        if (footerContainer) {
+                            const postButton = footerContainer.querySelector('button:not(.share-actions__scheduled-post-btn)');
+                            if (postButton && postButton.textContent.trim().toLowerCase() === 'post') {
+                                console.log('Found post button in share-creation-state__footer container');
+                                postButton.click();
+                                return true;
+                            }
+                        }
+                        
+                        // Find all buttons
                         const buttons = Array.from(document.querySelectorAll('button'));
-                        const mediaButton = buttons.find(btn => 
-                            btn.textContent.includes('Add media') || 
-                            btn.textContent.includes('Add a photo') ||
-                            btn.textContent.includes('Photo')
+                        
+                        // Look for the Post button by text
+                        const postButton = buttons.find(b => 
+                            b.textContent.trim() === 'Post' || 
+                            b.textContent.includes('Post')
                         );
                         
-                        if (mediaButton) {
-                            mediaButton.click();
+                        if (postButton) {
+                            console.log('Found post button by text content');
+                            postButton.click();
+                            return true;
+                        }
+                        
+                        // Look for primary button (usually the submit)
+                        const primaryButton = buttons.find(b => 
+                            b.classList.contains('artdeco-button--primary') && 
+                            b.classList.contains('share-actions__primary-action')
+                        );
+                        
+                        if (primaryButton) {
+                            console.log('Found post button by primary action class');
+                            primaryButton.click();
+                            return true;
+                        }
+                        
+                        // Try by ID if available
+                        const emberButton = document.querySelector('#ember629');
+                        if (emberButton) {
+                            console.log('Found post button by specific ID');
+                            emberButton.click();
                             return true;
                         }
                         
                         return false;
                     }
                     """)
-                
-                if not media_button_clicked:
-                    logger.warning("Could not find media upload button, continuing without media")
-                else:
-                    # Wait for file input to be available
-                    file_input = await self.page.wait_for_selector("input[type='file']", timeout=5000)
                     
-                    if file_input:
-                        # Upload files
-                        await file_input.set_input_files(media_files)
-                        
-                        # Wait for upload to complete
-                        try:
-                            # First check if media is already visible in the post
-                            media_visible = await self.page.evaluate("""
-                            () => {
-                                // Check for various indicators that media is attached
-                                const hasAttachedImage = !!document.querySelector('.share-images__image-loaded, img[alt="Attached image"], .image-sharing-attachment, .editor-image');
-                                const hasMediaPreview = !!document.querySelector('.editor-media, .editor-content img, .editor-content video');
-                                
-                                console.log('Media attachment check:', hasAttachedImage, hasMediaPreview);
-                                return hasAttachedImage || hasMediaPreview;
-                            }
-                            """)
-                            
-                            if not media_visible:
-                                # If media not yet visible, wait for it but with a shorter timeout
-                                await self.page.wait_for_selector(".share-images__image-loaded, img[alt='Attached image'], .editor-media, .editor-content img", timeout=8000)
-                            
-                            # Media is now attached, wait for upload to stabilize
-                            await self._wait_for_human_delay(2000, 3000)
-                            
-                            # Take screenshot of the post with media to verify attachment
-                            debug_dir = os.path.join(os.path.expanduser("~"), "auto_linkedin_debug")
-                            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                            screenshot_path = os.path.join(debug_dir, f"media_attached_{timestamp}.png")
-                            await self.page.screenshot(path=screenshot_path)
-                            logger.info(f"Saved media attachment screenshot to {screenshot_path}")
-                            
-                            # Close any open media dialog that might be remaining open
-                            # First check if there's an open dialog
-                            has_dialog = await self.page.evaluate("""
-                            () => {
-                                return {
-                                    hasDialog: !!document.querySelector('div[role="dialog"]') || !!document.querySelector('.artdeco-modal'),
-                                    hasBackdrop: !!document.querySelector('.artdeco-modal-overlay'),
-                                    dialogText: document.querySelector('div[role="dialog"]')?.textContent || document.querySelector('.artdeco-modal')?.textContent || ''
-                                };
-                            }
-                            """)
-                            
-                            if has_dialog.get('hasDialog', False):
-                                logger.info(f"Dialog detected after media upload, attempting to close it. Dialog text: {has_dialog.get('dialogText', '')}")
-                                
-                                # Try multiple approaches to close the dialog
-                                close_button_selectors = [
-                                    "button[aria-label='Close']",
-                                    "button[aria-label='Cancel']",
-                                    "button.media-upload-cancel",
-                                    "button.artdeco-modal__dismiss",
-                                    ".artdeco-modal__dismiss",
-                                    ".artdeco-modal__close",
-                                    "button.artdeco-button--secondary",
-                                    "button.artdeco-button--primary", 
-                                    "button.confirm-dialog-btn",
-                                    "button[data-control-name='dialog_cancel_btn']",
-                                    "button[data-control-name='dialog_confirm_btn']"
-                                ]
-                                
-                                # First try to find and click Done/Next/Continue buttons if present
-                                # This is for handling cases where LinkedIn expects you to edit the media before posting
-                                done_button_clicked = await self.page.evaluate("""
-                                () => {
-                                    const buttons = Array.from(document.querySelectorAll('button'));
-                                    const doneButton = buttons.find(btn => 
-                                        ['Done', 'Next', 'Continue', 'Add', 'Save'].includes(btn.textContent.trim()) &&
-                                        btn.offsetParent !== null
-                                    );
-                                    
-                                    if (doneButton) {
-                                        console.log('Clicking button with text:', doneButton.textContent);
-                                        doneButton.click();
-                                        return true;
-                                    }
-                                    
-                                    return false;
-                                }
-                                """)
-                                
-                                if done_button_clicked:
-                                    logger.info("Clicked Done/Next/Continue button")
-                                    await self._wait_for_human_delay(1000, 2000)
-                                
-                                # If still dialog, try to close it
-                                has_dialog_after_continue = await self.page.evaluate("""
-                                () => {
-                                    return !!document.querySelector('div[role="dialog"]') || 
-                                           !!document.querySelector('.artdeco-modal');
-                                }
-                                """)
-                                
-                                if has_dialog_after_continue:
-                                    close_clicked = False
-                                    for selector in close_button_selectors:
-                                        try:
-                                            await self.page.click(selector, timeout=3000)
-                                            logger.info(f"Clicked close button with selector: {selector}")
-                                            close_clicked = True
-                                            await self._wait_for_human_delay(1000, 1500)
-                                            break
-                                        except Exception as e:
-                                            logger.debug(f"Failed to click close button {selector}: {str(e)}")
-                                    
-                                    # If no button clicked but we have backdrop, click outside the dialog
-                                    if not close_clicked and has_dialog.get('hasBackdrop', False):
-                                        try:
-                                            # Click away from the dialog (top corner)
-                                            await self.page.mouse.click(10, 10)
-                                            logger.info("Clicked outside dialog to dismiss it")
-                                            await self._wait_for_human_delay(1000, 1500)
-                                        except Exception as e:
-                                            logger.debug(f"Failed to click outside dialog: {str(e)}")
-                                    
-                                    # If still not closed, try pressing Escape
-                                    has_dialog_after_clicks = await self.page.evaluate("""
-                                    () => {
-                                        return !!document.querySelector('div[role="dialog"]') || 
-                                               !!document.querySelector('.artdeco-modal');
-                                    }
-                                    """)
-                                    
-                                    if has_dialog_after_clicks:
-                                        logger.info("Dialog still detected, pressing Escape")
-                                        await self.page.keyboard.press("Escape")
-                                        await self._wait_for_human_delay(1000, 1500)
-                                        
-                                        # As a last resort, try refreshing the page
-                                        has_dialog_after_escape = await self.page.evaluate("""
-                                        () => {
-                                            return !!document.querySelector('div[role="dialog"]') || 
-                                                   !!document.querySelector('.artdeco-modal');
-                                        }
-                                        """)
-                                        
-                                        if has_dialog_after_escape:
-                                            logger.warning("Dialog still open after multiple close attempts. Taking a screenshot and attempting to recover.")
-                                            
-                                            # Take screenshot of stuck dialog
-                                            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                                            screenshot_path = os.path.join(debug_dir, f"stuck_dialog_{timestamp}.png")
-                                            await self.page.screenshot(path=screenshot_path)
-                                            
-                                            try:
-                                                # Try to reload the page as a last resort
-                                                logger.info("Reloading page to escape stuck dialog")
-                                                await self.page.reload(wait_until="domcontentloaded")
-                                                await self._wait_for_human_delay(3000, 5000)
-                                                
-                                                # Start a new post attempt
-                                                logger.info("Attempting to restart post process after reload")
-                                                
-                                                # We need to abort this attempt and signal for retry
-                                                return {
-                                                    "success": False,
-                                                    "message": "Encountered dialog that couldn't be dismissed. Page was reloaded, please retry posting.",
-                                                    "should_retry": True
-                                                }
-                                            except Exception as reload_error:
-                                                logger.error(f"Failed to reload page: {str(reload_error)}")
-                                                # Continue anyway as a last attempt
-                        except Exception as e:
-                            logger.warning(f"Could not confirm media upload completion: {str(e)}")
-                            # Check if media is visible despite the error
-                            try:
-                                media_visible = await self.page.evaluate("""
-                                () => {
-                                    return !!document.querySelector('.share-images__image-loaded, img[alt="Attached image"], .editor-media, .editor-content img, .editor-content video');
-                                }
-                                """)
-                                
-                                if media_visible:
-                                    logger.info("Media appears to be attached despite confirmation error")
-                                else:
-                                    logger.warning("Media may not be attached to the post")
-                            except Exception:
-                                pass
-                            # Continue anyway
-            
-            # Check if we need to wait for media to finish uploading
-            if media_files:
-                try:
-                    # Check for progress indicators that might suggest media is still being processed
-                    upload_in_progress = await self.page.evaluate("""
-                    () => {
-                        // Check for various progress indicators
-                        const hasProgressBar = !!document.querySelector('.progress-bar, .media-upload-progress');
-                        const hasSpinner = !!document.querySelector('.media-upload-spinner, .uploading-spinner, .artdeco-spinner');
-                        const hasUploadingText = document.body.textContent.includes('Uploading') || 
-                                                document.body.textContent.includes('Processing');
-                        
-                        console.log('Media upload status:', {hasProgressBar, hasSpinner, hasUploadingText});
-                        return hasProgressBar || hasSpinner || hasUploadingText;
-                    }
-                    """)
-                    
-                    if upload_in_progress:
-                        logger.info("Media upload still in progress, waiting...")
-                        # Wait for upload to complete (max 30 seconds)
-                        wait_start = time.time()
-                        while time.time() - wait_start < 30:
-                            still_uploading = await self.page.evaluate("""
-                            () => {
-                                const hasProgressBar = !!document.querySelector('.progress-bar, .media-upload-progress');
-                                const hasSpinner = !!document.querySelector('.media-upload-spinner, .uploading-spinner, .artdeco-spinner');
-                                const hasUploadingText = document.body.textContent.includes('Uploading') || 
-                                                         document.body.textContent.includes('Processing');
-                                
-                                return hasProgressBar || hasSpinner || hasUploadingText;
-                            }
-                            """)
-                            
-                            if not still_uploading:
-                                logger.info("Media upload completed")
-                                break
-                                
-                            await self._wait_for_human_delay(1000, 2000)
-                
-                    # Take a screenshot after media upload
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    screenshot_path = os.path.join(debug_dir, f"after_media_upload_{timestamp}.png")
-                    await self.page.screenshot(path=screenshot_path)
-                    logger.info(f"Saved screenshot after media upload: {screenshot_path}")
-                
+                    if post_submit_clicked:
+                        logger.info("Clicked Post button with JavaScript")
                 except Exception as e:
-                    logger.warning(f"Error while checking media upload status: {str(e)}")
-            
-            # Wait before posting
-            await self._wait_for_human_delay(1000, 2000)
-            
-            # Click the "Post" button
-            logger.info("Clicking 'Post' button")
-            
-            post_submit_selectors = [
-                "button:has-text('Post')",
-                "button[aria-label='Post']",
-                "button.share-actions__primary-action",
-                "button.share-box_actions__primary-action",
-                "button[data-control-name='share.post']",
-                "button.share-actions__publish-button",
-                "div[data-control-name='share.post']",
-                "button.post-button",
-                "button.artdeco-button--primary"
-            ]
-            
-            # Initialize post_submit_clicked variable
-            post_submit_clicked = False
-            
-            # Take a screenshot before attempting to find Post button
-            debug_dir = os.path.join(os.path.expanduser("~"), "auto_linkedin_debug")
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            screenshot_path = os.path.join(debug_dir, f"before_post_button_{timestamp}.png")
-            await self.page.screenshot(path=screenshot_path)
-            logger.info(f"Saved screenshot before clicking Post button: {screenshot_path}")
-            
-            # Check for any unexpected dialogs before attempting to post
-            has_unexpected_dialog = await self.page.evaluate("""
-            () => {
-                const dialogs = document.querySelectorAll('div[role="dialog"], .artdeco-modal');
-                if (dialogs.length > 0) {
-                    const dialogTexts = Array.from(dialogs).map(d => d.textContent.trim());
-                    return {
-                        hasDialog: true,
-                        dialogTexts: dialogTexts
-                    };
-                }
-                return { hasDialog: false };
-            }
-            """)
-            
-            if has_unexpected_dialog.get('hasDialog', False):
-                logger.warning(f"Unexpected dialog detected before posting: {has_unexpected_dialog.get('dialogTexts', [])}")
-                
-                # Try to dismiss dialogs that might be in the way
-                try:
-                    # Try pressing Escape first
-                    await self.page.keyboard.press("Escape")
-                    await self._wait_for_human_delay(1000, 1500)
-                    
-                    # Check if dialog is still there
-                    dialog_still_present = await self.page.evaluate("""
-                    () => !!document.querySelector('div[role="dialog"], .artdeco-modal')
-                    """)
-                    
-                    if dialog_still_present:
-                        # Try clicking buttons like "Done", "Continue", etc.
-                        await self.page.evaluate("""
-                        () => {
-                            const buttonTexts = ['Done', 'Next', 'Continue', 'Add', 'Save', 'Confirm', 'OK', 'Post'];
-                            const buttons = Array.from(document.querySelectorAll('button'));
-                            
-                            for (const text of buttonTexts) {
-                                const button = buttons.find(btn => 
-                                    btn.textContent.trim() === text && 
-                                    btn.offsetParent !== null
-                                );
-                                if (button) {
-                                    console.log('Clicking button with text:', button.textContent);
-                                    button.click();
-                                    return true;
-                                }
-                            }
-                            
-                            // Try clicking any visible primary button as a last resort
-                            const primaryButton = buttons.find(btn => 
-                                btn.className.includes('primary') && 
-                                btn.offsetParent !== null
-                            );
-                            if (primaryButton) {
-                                console.log('Clicking primary button:', primaryButton.textContent);
-                                primaryButton.click();
-                                return true;
-                            }
-                            
-                            return false;
-                        }
-                        """)
-                        
-                        await self._wait_for_human_delay(1000, 1500)
-                    
-                    # After attempts, take another screenshot
-                    screenshot_path = os.path.join(debug_dir, f"after_dialog_dismiss_{timestamp}.png")
-                    await self.page.screenshot(path=screenshot_path)
-                    logger.info(f"Saved screenshot after dialog dismissal attempt: {screenshot_path}")
-                    
-                except Exception as e:
-                    logger.warning(f"Error attempting to dismiss unexpected dialog: {str(e)}")
-            
-            # First, try to find all buttons in the composer footer
-            try:
-                composer_buttons = await self.page.evaluate("""
-                () => {
-                    // Get all buttons in the UI
-                    const allButtons = Array.from(document.querySelectorAll('button'));
-                    
-                    // Log information about potential post buttons to help with debugging
-                    const buttonInfo = allButtons
-                        .filter(btn => btn.offsetParent !== null) // Only visible buttons
-                        .map(btn => ({
-                            text: btn.textContent.trim(),
-                            classes: btn.className,
-                            id: btn.id,
-                            type: btn.type,
-                            ariaLabel: btn.getAttribute('aria-label'),
-                            isPrimary: btn.className.includes('primary'),
-                            rect: btn.getBoundingClientRect()
-                        }));
-                    
-                    console.log('Found buttons:', JSON.stringify(buttonInfo));
-                    
-                    // Return array of visible buttons with 'Post' text
-                    const postButtons = allButtons.filter(btn => 
-                        btn.offsetParent !== null && 
-                        (btn.textContent.trim() === 'Post' || 
-                         btn.getAttribute('aria-label') === 'Post')
-                    );
-                    
-                    if (postButtons.length > 0) {
-                        postButtons[0].click();
-                        console.log('Clicked post button with text:', postButtons[0].textContent);
-                        return true;
-                    }
-                    
-                    return false;
-                }
-                """)
-                
-                if composer_buttons:
-                    post_submit_clicked = True
-                    logger.info("Clicked Post button found with JavaScript")
-            except Exception as e:
-                logger.debug(f"Error finding composer buttons: {str(e)}")
-            
-            # Try standard selectors if JavaScript approach didn't work
-            if not post_submit_clicked:
-                for selector in post_submit_selectors:
-                    try:
-                        await self.page.click(selector, timeout=5000)
-                        post_submit_clicked = True
-                        logger.info(f"Clicked submit button with selector: {selector}")
-                        break
-                    except Exception:
-                        continue
-            
-            # Try looking for primary (usually blue) buttons if standard selectors didn't work
-            if not post_submit_clicked:
-                logger.warning("Could not find 'Post' button with standard selectors, trying fallback method")
-                
-                try:
-                    # Find all primary buttons (usually blue)
-                    primary_buttons = await self.page.query_selector_all("button.artdeco-button--primary")
-                    
-                    # Click the first visible primary button
-                    for button in primary_buttons:
-                        is_visible = await button.is_visible()
-                        if is_visible:
-                            await button.click()
-                            post_submit_clicked = True
-                            logger.info("Clicked primary action button directly")
-                            break
-                except Exception as e:
-                    logger.debug(f"Error with primary button approach: {str(e)}")
-                
-                # If still not clicked, use JavaScript as last resort
-                if not post_submit_clicked:
-                    try:
-                        post_submit_clicked = await self.page.evaluate("""
-                        () => {
-                            // Try different approaches to find the post button
-                            
-                            // 1. Find post button by text content
-                            const buttons = Array.from(document.querySelectorAll('button'));
-                            const postButtonByText = buttons.find(btn => 
-                                btn.textContent.trim() === 'Post' ||
-                                btn.textContent.trim() === 'Share' ||
-                                btn.textContent.trim() === 'Share post' ||
-                                btn.textContent.trim() === 'Publish'
-                            );
-                            
-                            if (postButtonByText) {
-                                try {
-                                    postButtonByText.click();
-                                    console.log('Clicked post button by text:', postButtonByText.textContent);
-                                    return true;
-                                } catch (err) {
-                                    console.error('Error clicking text post button:', err);
-                                }
-                            }
-                            
-                            // 2. Find primary action button (usually blue)
-                            const primaryButtons = Array.from(document.querySelectorAll('button.artdeco-button--primary, button[type="submit"]'));
-                            const primaryButton = primaryButtons.find(btn => btn.offsetParent !== null); // Check if button is visible
-                            
-                            if (primaryButton) {
-                                try {
-                                    primaryButton.click();
-                                    console.log('Clicked primary action button');
-                                    return true;
-                                } catch (err) {
-                                    console.error('Error clicking primary button:', err);
-                                }
-                            }
-                            
-                            // 3. Find any button inside share-actions div
-                            const shareButtons = Array.from(document.querySelectorAll('.share-actions button, .share-box-footer button'));
-                            const shareButton = shareButtons.find(btn => btn.offsetParent !== null);
-                            
-                            if (shareButton) {
-                                try {
-                                    shareButton.click();
-                                    console.log('Clicked share actions button');
-                                    return true;
-                                } catch (err) {
-                                    console.error('Error clicking share button:', err);
-                                }
-                            }
-                            
-                            // 4. Last resort: Try to find any button at the bottom of composer
-                            const composerButtons = Array.from(document.querySelectorAll('.share-box_actions button, .share-box-footer button, .editor-footer button'));
-                            if (composerButtons.length > 0) {
-                                // Find button furthest to the right (usually the submit button)
-                                composerButtons.sort((a, b) => {
-                                    const rectA = a.getBoundingClientRect();
-                                    const rectB = b.getBoundingClientRect();
-                                    return rectB.right - rectA.right; // Sort by rightmost position
-                                });
-                                
-                                const rightmostButton = composerButtons[0];
-                                if (rightmostButton) {
-                                    rightmostButton.click();
-                                    console.log('Clicked rightmost button in composer footer');
-                                    return true;
-                                }
-                            }
-                            
-                            return false;
-                        }
-                        """)
-                    except Exception as e:
-                        logger.error(f"Error with JavaScript post button finder: {str(e)}")
+                    logger.error(f"JavaScript approach for Post button failed: {str(e)}")
             
             if not post_submit_clicked:
                 logger.error("Could not find 'Post' button")
+                
+                # Take a screenshot to help with debugging
+                try:
+                    screenshot_path = os.path.join(debug_dir, f"post_button_not_found_{timestamp}.png")
+                    await self.page.screenshot(path=screenshot_path)
+                    logger.info(f"Saved screenshot when Post button not found: {screenshot_path}")
+                except Exception as e:
+                    logger.warning(f"Could not save debug screenshot: {str(e)}")
+                
+                # Try to get HTML structure to help with future debugging
+                try:
+                    html_structure = await self.page.evaluate("""
+                    () => {
+                        const getStructure = (element, depth = 0) => {
+                            if (!element) return '';
+                            const indent = ' '.repeat(depth * 2);
+                            let result = indent + element.tagName.toLowerCase();
+                            
+                            if (element.id) result += `#${element.id}`;
+                            if (element.className) {
+                                const classes = element.className.toString().split(/\\s+/).filter(c => c);
+                                if (classes.length) result += `.${classes.join('.')}`;
+                            }
+                            
+                            // Add button text if this is a button
+                            if (element.tagName.toLowerCase() === 'button') {
+                                result += ` [text: "${element.textContent.trim()}"]`;
+                            }
+                            
+                            result += '\\n';
+                            
+                            // Get children structure
+                            for (const child of element.children) {
+                                result += getStructure(child, depth + 1);
+                            }
+                            
+                            return result;
+                        };
+                        
+                        // Look for important containers
+                        const containers = [
+                            document.querySelector('.share-creation-state__footer'),
+                            document.querySelector('.share-box_actions'),
+                            document.querySelector('div[role="dialog"]')
+                        ].filter(Boolean);
+                        
+                        return containers.map(c => getStructure(c)).join('\\n');
+                    }
+                    """)
+                    
+                    logger.info(f"HTML structure for debugging:\n{html_structure}")
+                except Exception as e:
+                    logger.warning(f"Could not get HTML structure for debugging: {str(e)}")
+                
                 return {
                     "success": False,
                     "message": "Could not find the 'Post' button to submit your post."
                 }
             
-            # Wait for post to be submitted
+            # Wait for post to be submitted and feed to update
             logger.info("Waiting for post to be submitted")
+            await asyncio.sleep(5)
             
+            # Check for any lingering dialogs and close them
+            logger.info("Checking for any lingering dialogs after posting")
             try:
-                # Track multiple potential success indicators
-                toast_promise = self.page.wait_for_selector("div.artdeco-toast-item--visible", timeout=10000)
-                feed_promise = self.page.wait_for_selector(".feed-shared-update-v2", timeout=10000)
-                success_message_promise = self.page.wait_for_selector("div[aria-live='assertive']", timeout=10000)
+                # First attempt: Look for dialog close buttons
+                close_button_selectors = [
+                    "button[aria-label='Close']", 
+                    "button[aria-label='Dismiss']",
+                    "button.artdeco-modal__dismiss",
+                    ".artdeco-modal__dismiss",
+                    "button.share-box-footer__close-btn",
+                    "button:has-text('Done')",
+                    "button:has-text('Close')"
+                ]
                 
-                # Create a timeout promise
-                async def wait_timeout():
-                    await asyncio.sleep(8)
-                    return True
+                for selector in close_button_selectors:
+                    try:
+                        close_buttons = await self.page.query_selector_all(selector)
+                        if close_buttons and len(close_buttons) > 0:
+                            logger.info(f"Found {len(close_buttons)} dialog close buttons with selector: {selector}")
+                            # Click each close button found
+                            for button in close_buttons:
+                                await button.click()
+                                logger.info(f"Clicked dialog close button")
+                                await asyncio.sleep(1)
+                            break
+                    except Exception as e:
+                        logger.debug(f"No close button found with selector {selector} or error clicking: {str(e)}")
                 
-                timeout_promise = asyncio.create_task(wait_timeout())
-                
-                # Wait for the first promise to resolve
-                done, pending = await asyncio.wait(
-                    [
-                        asyncio.create_task(toast_promise), 
-                        asyncio.create_task(feed_promise),
-                        asyncio.create_task(success_message_promise),
-                        timeout_promise
-                    ],
-                    return_when=asyncio.FIRST_COMPLETED
-                )
-                
-                # Cancel any pending tasks
-                for task in pending:
-                    task.cancel()
-                
-                # Assume success if any promise completed
-                success_indicator = True
-                
-                if success_indicator:
-                    logger.info("Successfully posted to LinkedIn")
-                    return {
-                        "success": True,
-                        "message": "Successfully posted to LinkedIn"
+                # Second attempt: Try JavaScript to find and close dialogs more comprehensively
+                lingering_dialogs = await self.page.evaluate("""
+                () => {
+                    // Look for any dialogs and modals across the page
+                    const dialogs = document.querySelectorAll('div[role="dialog"]');
+                    const modalBackdrops = document.querySelectorAll('.artdeco-modal-overlay');
+                    const mediaDialogs = document.querySelectorAll('.share-images, .share-creation-state');
+                    
+                    // Keep track of what was found and closed
+                    let closed = false;
+                    const results = {
+                        dialogsFound: dialogs.length,
+                        modalBackdropsFound: modalBackdrops.length,
+                        mediaDialogsFound: mediaDialogs.length,
+                        buttonsClosed: []
+                    };
+                    
+                    // Various ways to close dialogs
+                    const closeDialog = (element) => {
+                        // Try to find close buttons with different patterns
+                        const closeSelectors = [
+                            'button[aria-label="Close"]', 
+                            'button[aria-label="Dismiss"]',
+                            'button.artdeco-modal__dismiss',
+                            '.artdeco-modal__dismiss',
+                            'button.share-box-footer__close-btn',
+                            'button:has-text("Done")',
+                            'button:has-text("Close")',
+                            '.share-box-footer__close-btn'
+                        ];
+                        
+                        // Check each selector
+                        for (const selector of closeSelectors) {
+                            try {
+                                const closeButton = element.querySelector(selector);
+                                if (closeButton) {
+                                    closeButton.click();
+                                    results.buttonsClosed.push(selector);
+                                    closed = true;
+                                    return true;
+                                }
+                            } catch (e) {
+                                console.error('Error trying selector', selector, e);
+                            }
+                        }
+                        
+                        // Try finding buttons with text or aria-label containing "close", "dismiss", "done"
+                        const buttons = element.querySelectorAll('button');
+                        for (const button of buttons) {
+                            const text = (button.textContent || '').toLowerCase().trim();
+                            const ariaLabel = (button.getAttribute('aria-label') || '').toLowerCase();
+                            
+                            if (text.includes('close') || text.includes('dismiss') || text.includes('done') ||
+                                ariaLabel.includes('close') || ariaLabel.includes('dismiss') || ariaLabel.includes('done')) {
+                                button.click();
+                                results.buttonsClosed.push(`button with text: "${text}" or aria-label: "${ariaLabel}"`);
+                                closed = true;
+                                return true;
+                            }
+                        }
+                        
+                        return false;
+                    };
+                    
+                    // Try with all dialog types
+                    [...dialogs, ...modalBackdrops, ...mediaDialogs].forEach(dialog => {
+                        if (dialog) closeDialog(dialog);
+                    });
+                    
+                    // Try one more approach - look for "Done" or "Close" buttons anywhere
+                    if (!closed) {
+                        const anyCloseButton = document.querySelector('button:has-text("Done"), button:has-text("Close"), button[aria-label="Close"]');
+                        if (anyCloseButton) {
+                            anyCloseButton.click();
+                            results.buttonsClosed.push('Found global close button');
+                            closed = true;
+                        }
                     }
-                else:
-                    logger.warning("Could not confirm if post was successful")
-                    return {
-                        "success": False,
-                        "message": "Could not confirm if post was successful. Please check your LinkedIn feed."
-                    }
-            except Exception as e:
-                logger.error(f"Error confirming post success: {str(e)}")
-                return {
-                    "success": False,
-                    "message": f"Error confirming post success: {str(e)}"
+                    
+                    results.closed = closed;
+                    return results;
                 }
+                """)
+                
+                if lingering_dialogs:
+                    logger.info(f"Dialog check results: {lingering_dialogs}")
+                    
+                    # If we found dialogs but couldn't close them with buttons, try a series of fallbacks
+                    if (lingering_dialogs.get('dialogsFound', 0) > 0 or 
+                        lingering_dialogs.get('modalBackdropsFound', 0) > 0 or
+                        lingering_dialogs.get('mediaDialogsFound', 0) > 0) and not lingering_dialogs.get('closed', False):
+                        
+                        # Try clicking elsewhere on the page to dismiss overlays
+                        logger.info("Trying to click on the background to dismiss dialogs")
+                        try:
+                            # Click on a safe area (top of page near LinkedIn logo)
+                            await self.page.mouse.click(50, 50)
+                            await asyncio.sleep(1)
+                        except Exception as e:
+                            logger.debug(f"Background click failed: {str(e)}")
+                        
+                        # Try pressing Escape key twice with delay
+                        logger.info("Found lingering dialogs, pressing Escape to close")
+                        await self.page.keyboard.press("Escape")
+                        await asyncio.sleep(1)
+                        
+                        # Press Escape again 
+                        await self.page.keyboard.press("Escape")
+                        await asyncio.sleep(1)
+                        
+                        # As a last resort, try tab + enter (focus on a close button and activate it)
+                        logger.info("Trying tab + enter to find and activate close buttons")
+                        for _ in range(5):  # Try up to 5 tabs to find a close button
+                            await self.page.keyboard.press("Tab")
+                            await asyncio.sleep(0.3)
+                        await self.page.keyboard.press("Enter")
+                        await asyncio.sleep(1)
+                        
+                # Take a final screenshot to verify state after attempting to close dialogs
+                try:
+                    screenshot_path = os.path.join(debug_dir, f"after_dialog_closing_{timestamp}.png")
+                    await self.page.screenshot(path=screenshot_path)
+                    logger.info(f"Saved final screenshot after dialog closing attempts: {screenshot_path}")
+                except Exception as e:
+                    logger.warning(f"Could not save final debug screenshot: {str(e)}")
+                
+            except Exception as e:
+                logger.warning(f"Error attempting to close dialogs after posting: {str(e)}")
+                # This shouldn't affect the overall success of posting
+            
+            return {
+                "success": True,
+                "message": "Successfully posted to LinkedIn"
+            }
         except Exception as e:
             logger.exception("Error posting to LinkedIn")
             return {

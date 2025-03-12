@@ -12,6 +12,7 @@ from PyQt6.QtCore import QDir
 
 from .browser import LinkedInController
 from .utils import Config, DataLoader
+from .utils.playwright_helper import ensure_playwright_browsers_installed
 from .ui import MainWindow
 from .scheduler import PostScheduler
 
@@ -202,6 +203,10 @@ def run_app():
     
     # Setup logging
     setup_logging(args.debug)
+    
+    # Ensure Playwright browsers are properly configured
+    # This is especially important for PyInstaller bundles
+    ensure_playwright_browsers_installed()
     
     # Create and run application
     application = Application(args)
