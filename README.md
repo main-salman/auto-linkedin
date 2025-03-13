@@ -7,7 +7,8 @@ MADE USING [CURSOR AI IDE](https://www.cursor.com/)
 
 An advanced Python application for automating LinkedIn interactions. Post content effortlessly to your LinkedIn profile with scheduled posts, media attachments, and more.
 
-![Auto LinkedIn Preview](https://github.com/main-salman/auto-linkedin/raw/main/docs/images/app_preview.png)
+![Auto LinkedIn Preview]<img width="1156" alt="image" src="https://github.com/user-attachments/assets/e8071d88-3e0d-4360-8f8a-c1226828945f" />
+
 
 ## ✨ Features
 
