@@ -1,4 +1,5 @@
 # Auto-LinkedIn
+MADE USING [CURSOR AI IDE](https://www.cursor.com/) 
 
 ![GitHub License](https://img.shields.io/github/license/main-salman/auto-linkedin)
 ![Python Version](https://img.shields.io/badge/python-3.9%2B-blue)
